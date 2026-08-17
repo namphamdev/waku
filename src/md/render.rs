@@ -1192,7 +1192,10 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
                 )
                 .child(
                     div()
-                        .flex_1()
+                        // flex_auto, not flex_1: a zero flex-basis erases the
+                        // content's intrinsic width, collapsing shrink-wrapped
+                        // user bubbles to the quote bar.
+                        .flex_auto()
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -1251,7 +1254,10 @@ fn render_list(ordered_start: Option<u64>, items: &[ListItem], ctx: &Ctx) -> Any
                 .child(marker)
                 .child(
                     div()
-                        .flex_1()
+                        // flex_auto, not flex_1: a zero flex-basis erases the
+                        // content's intrinsic width, collapsing shrink-wrapped
+                        // user bubbles to the marker column.
+                        .flex_auto()
                         .min_w_0()
                         .flex()
                         .flex_col()
