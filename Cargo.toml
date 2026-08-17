@@ -48,6 +48,9 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 waku-client = { path = "crates/waku-client" }
 waku-protocol = { path = "crates/waku-protocol" }
 pulldown-cmark = "0.13"
+# Pure-Rust Mermaid renderer. SVG-only: GPUI rasterizes the returned SVG, so the
+# CLI and PNG (resvg/usvg) features would only add dependencies we never use.
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 regex = "1"
 rust-i18n = "4"
 rust-umami = "0.1.1"

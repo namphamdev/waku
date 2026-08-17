@@ -294,6 +294,35 @@
   .markdown pre {
     @apply max-w-full overflow-x-auto rounded-xl border bg-muted/45 p-4 font-mono text-[13px] leading-6;
   }
+  .markdown .mermaid-diagram {
+    @apply max-w-full overflow-auto rounded-xl border bg-muted/45 p-4;
+    max-height: 480px;
+  }
+  .markdown .mermaid-diagram--zoomable {
+    cursor: grab;
+  }
+  .markdown .mermaid-diagram--dragging {
+    cursor: grabbing;
+  }
+  .markdown .mermaid-diagram svg {
+    @apply block;
+  }
+  .markdown .mermaid-diagram--zoomable svg {
+    @apply h-full w-full;
+    max-width: none;
+  }
+  .markdown .mermaid-diagram--fallback svg {
+    @apply h-auto max-w-full;
+  }
+  .markdown .mermaid-diagram__content {
+    @apply select-none;
+  }
+  .markdown .mermaid-diagram__reset {
+    @apply absolute right-2 top-2 flex h-6 items-center gap-1 rounded-md border bg-card px-2 text-[11px] font-medium text-[var(--text-secondary)] shadow-sm outline-none hover:bg-accent hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring;
+  }
+  .markdown .mermaid-diagram--loading {
+    @apply flex items-center justify-center;
+  }
   .markdown table { @apply block max-w-full overflow-x-auto border-collapse text-sm; }
   .markdown th,
   .markdown td { @apply border px-3 py-2 text-left; }

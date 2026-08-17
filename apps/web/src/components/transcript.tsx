@@ -10,6 +10,7 @@ import { Virtuoso, type ListItem, type VirtuosoHandle } from 'react-virtuoso'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { PreviewableImage } from '@/components/image-preview'
+import { MermaidDiagram } from '@/components/mermaid'
 import { FileTypeIcon, WakuIcon, type WakuIconName } from '@/components/waku-icon'
 import { readAttachmentImage } from '@/lib/attachments'
 import { useDaemon } from '@/lib/daemon-context'
@@ -1403,6 +1404,38 @@ function Markdown({
               source={src}
             />
           ) : null,
+          pre: ({ node, children, ...props }) => {
+            const code = node?.children.find(
+              (child) => child.type === 'element' && child.tagName === 'code',
+            )
+            const classes = code?.type === 'element'
+              ? code.properties?.className
+              : undefined
+            const isMermaid = code?.type === 'element'
+              && (Array.isArray(classes) ? classes : classes ? [classes] : [])
+                .some((name) => (
+                  typeof name === 'string' && name.toLowerCase() === 'language-mermaid'
+                ))
+            if (!isMermaid || code?.type !== 'element') {
+              return <pre {...props}>{children}</pre>
+            }
+            const source = (code.children ?? [])
+              .filter((child) => child.type === 'text')
+              .map((child) => child.value)
+              .join('')
+              .replace(/\n$/, '')
+            if (streaming) {
+              // An incomplete diagram cannot be laid out, so the live block
+              // keeps showing its source until the response settles.
+              return <pre {...props}>{children}</pre>
+            }
+            return (
+              <MermaidDiagram
+                code={source}
+                fallback={<pre {...props}>{children}</pre>}
+              />
+            )
+          },
         }}
       >
         {text}

@@ -20,15 +20,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Font, FontStyle,
     FontWeight, Hsla, InteractiveText, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, SharedString, StrikethroughStyle,
-    StyledText, TextLayout, TextRun, UnderlineStyle, Window, canvas, div, font, img, point,
-    prelude::*, px, quad, relative, size,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle, StyledText, TextLayout,
+    TextRun, UnderlineStyle, Window, canvas, div, font, img, point, prelude::*, px, quad, relative,
+    size,
 };
+use mermaid_rs_renderer::{RenderOptions, Theme as MermaidTheme, render_with_options};
 
 use super::highlight::{self, Lang, TokenClass};
 use super::mend::PENDING_LINK_URL;
@@ -318,6 +321,42 @@ pub fn flatten_plain(
 
 // ── Per-message state ──────────────────────────────────────────────────────
 
+/// One cached Mermaid render for a code block. Keyed by the block's element
+/// ordinal, with the source hash checked on hit so an edited diagram at the
+/// same ordinal re-renders instead of showing a stale image. `image == None`
+/// records a failed render, keeping the fallback code view stable without
+/// retrying. Zoom and pan state live here too so they survive element
+/// re-renders and streaming appends.
+struct MermaidCacheEntry {
+    code_hash: u64,
+    /// Natural logical size of the SVG, parsed from its root element.
+    natural_size: Option<(f32, f32)>,
+    image: Option<Arc<gpui::Image>>,
+    /// Zoom multiplier over natural size. [`MERMAID_ZOOM_FIT`] is the default
+    /// view: fitted to the render box, with the exact scale resolved from the
+    /// container's laid-out bounds once the user zooms.
+    zoom: f32,
+    /// Drag-to-pan start: the cursor position and scroll offset when the grab
+    /// began. `None` while not dragging.
+    drag_start: Option<(Point<Pixels>, Point<Pixels>)>,
+    scroll_handle: ScrollHandle,
+}
+
+/// Shared, cross-frame Mermaid state. Event handlers capture a clone of this
+/// `Rc` so zoom and pan changes can re-render without holding a borrow on the
+/// markdown view.
+type MermaidState = Rc<RefCell<HashMap<usize, MermaidCacheEntry>>>;
+
+/// A snapshot of one diagram's cached render state, cloned out of the shared
+/// cache so a render pass can read it without holding the borrow.
+struct MermaidRender {
+    image: Option<Arc<gpui::Image>>,
+    natural_size: Option<(f32, f32)>,
+    zoom: f32,
+    dragging: bool,
+    scroll_handle: ScrollHandle,
+}
+
 /// Everything the renderer keeps between frames for one markdown body.
 ///
 /// The flatten cache is keyed by element ordinal and pruned only back to the
@@ -343,6 +382,10 @@ pub struct MarkdownView {
     /// outside the parsed/flattened caches so a three-second icon change never
     /// invalidates text shaping.
     copied_code_blocks: Rc<RefCell<HashMap<usize, u64>>>,
+    /// Rendered Mermaid diagrams keyed by code-block ordinal. Rendering is
+    /// deferred until a response settles (streaming blocks show their source),
+    /// and failures are cached too so a broken diagram never re-parses.
+    mermaid: MermaidState,
     streaming: Cell<bool>,
 }
 
@@ -362,6 +405,7 @@ impl MarkdownView {
             style: Cell::new(None),
             veil: RefCell::new(RowVeil::default()),
             copied_code_blocks: Rc::new(RefCell::new(HashMap::new())),
+            mermaid: Rc::new(RefCell::new(HashMap::new())),
             streaming: Cell::new(false),
         }
     }
@@ -435,6 +479,9 @@ impl MarkdownView {
         if self.style.get() != Some(current) {
             self.style.set(Some(current));
             self.flats.borrow_mut().clear();
+            // Mermaid colors are baked into the rasterized SVG, so a theme
+            // switch has to drop those too.
+            self.mermaid.borrow_mut().clear();
         }
     }
 
@@ -445,6 +492,60 @@ impl MarkdownView {
             .entry(ordinal)
             .or_insert_with(|| Rc::new(build()))
             .clone()
+    }
+
+    /// Cached Mermaid raster source and interaction state for a code block,
+    /// rendered on miss. The SVG is produced synchronously here (matching the
+    /// settled code block's one-time highlight tokenization); GPUI rasterizes
+    /// it off the UI thread through its image asset cache.
+    fn mermaid_render(&self, ordinal: usize, code: &str, is_dark: bool) -> MermaidRender {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        code.hash(&mut hasher);
+        let code_hash = hasher.finish();
+
+        if let Some(entry) = self.mermaid.borrow().get(&ordinal) {
+            if entry.code_hash == code_hash {
+                return MermaidRender {
+                    image: entry.image.clone(),
+                    natural_size: entry.natural_size,
+                    zoom: entry.zoom,
+                    dragging: entry.drag_start.is_some(),
+                    scroll_handle: entry.scroll_handle.clone(),
+                };
+            }
+        }
+
+        let (image, natural_size) = match render_mermaid_svg(code, is_dark) {
+            Some(svg) => {
+                let natural_size = mermaid_svg_size(&svg);
+                let image = Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Svg,
+                    svg.into_bytes(),
+                ));
+                (Some(image), natural_size)
+            }
+            None => (None, None),
+        };
+
+        let entry = MermaidCacheEntry {
+            code_hash,
+            natural_size,
+            image: image.clone(),
+            zoom: MERMAID_ZOOM_FIT,
+            drag_start: None,
+            scroll_handle: ScrollHandle::new(),
+        };
+        let render = MermaidRender {
+            image,
+            natural_size,
+            zoom: MERMAID_ZOOM_FIT,
+            dragging: false,
+            scroll_handle: entry.scroll_handle.clone(),
+        };
+        self.mermaid.borrow_mut().insert(ordinal, entry);
+        render
     }
 
     /// Display blocks in document order: the settled prefix, then the mended
@@ -1059,7 +1160,19 @@ fn render_block(block: &Block, ctx: &Ctx) -> AnyElement {
                 .into_any_element()
         }
         Block::Image { url, alt } => render_image(url, alt, ctx),
-        Block::CodeBlock { language, code } => render_code_block(language.as_deref(), code, ctx),
+        Block::CodeBlock { language, code } => {
+            let mermaid = language
+                .as_deref()
+                .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"));
+            // An incomplete diagram cannot be laid out, so a streaming block
+            // keeps showing its source until the response settles.
+            let streaming = ctx.cache.is_some_and(|view| view.streaming.get());
+            if mermaid && !streaming {
+                render_mermaid_block(language.as_deref(), code, ctx)
+            } else {
+                render_code_block(language.as_deref(), code, ctx)
+            }
+        }
         Block::BlockQuote { children } => {
             let rendered = children
                 .iter()
@@ -1286,40 +1399,26 @@ pub fn decode_data_url(url: &str) -> Option<std::sync::Arc<gpui::Image>> {
     (!bytes.is_empty()).then(|| std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
 }
 
-fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElement {
-    let key = ctx.next_key();
-    // Tokenizing is the most expensive flatten in the document, so a settled
-    // code block is exactly the case the cache exists for.
-    let flat = ctx.flat(key.index, || {
-        let lang = language.and_then(highlight::lang_for_tag);
-        let mut code_font = font(MONO_FAMILY);
-        code_font.weight = FontWeight::NORMAL;
-        FlatText {
-            text: SharedString::from(code.to_owned()),
-            runs: code_runs(code, lang, &code_font, ctx.palette),
-            links: Vec::new(),
-            code_ranges: Vec::new(),
-        }
-    });
-    let label = language
-        .filter(|language| !language.is_empty())
-        .map(|language| language.to_ascii_lowercase());
-    // Reuse the cached shaped string. Settled code blocks render every frame,
-    // so cloning the whole source here would turn the copy affordance into a
-    // permanent O(code length) render cost; allocate only when it is invoked.
-    let copy_content = flat.text.clone();
-    let keyboard_copy_content = copy_content.clone();
-    let copy_feedback = ctx.cache.map(|view| view.copied_code_blocks.clone());
-    let copied = copy_feedback
+/// The transcript's copy affordance, shared by code blocks and diagrams.
+///
+/// `content` is a `SharedString` so the per-frame clone stays O(1); the source
+/// bytes are only copied when the clipboard write actually runs.
+fn code_copy_button(
+    id_prefix: &str,
+    key: &TextKey,
+    content: SharedString,
+    ctx: &Ctx,
+) -> impl IntoElement {
+    let feedback = ctx.cache.map(|view| view.copied_code_blocks.clone());
+    let copied = feedback
         .as_ref()
         .is_some_and(|feedback| feedback.borrow().contains_key(&key.index));
-    let keyboard_copy_feedback = copy_feedback.clone();
+    let keyboard_content = content.clone();
+    let keyboard_feedback = feedback.clone();
     let ordinal = key.index;
-    let copy_button = div()
-        .id(SharedString::from(format!(
-            "copy-code-{}-{}",
-            key.row, key.index
-        )))
+
+    div()
+        .id(SharedString::from(format!("{id_prefix}-{}-{}", key.row, key.index)))
         .tab_index(0)
         .size(px(24.0))
         .flex_none()
@@ -1345,20 +1444,494 @@ fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElemen
             tr!("common.copy_code")
         }))
         .on_click(move |_, _, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(copy_content.to_string()));
-            if let Some(feedback) = copy_feedback.clone() {
+            cx.write_to_clipboard(ClipboardItem::new_string(content.to_string()));
+            if let Some(feedback) = feedback.clone() {
                 show_code_copied(feedback, ordinal, cx);
             }
         })
         .on_key_down(move |event: &KeyDownEvent, _, cx| {
             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                cx.write_to_clipboard(ClipboardItem::new_string(keyboard_copy_content.to_string()));
-                if let Some(feedback) = keyboard_copy_feedback.clone() {
+                cx.write_to_clipboard(ClipboardItem::new_string(keyboard_content.to_string()));
+                if let Some(feedback) = keyboard_feedback.clone() {
                     show_code_copied(feedback, ordinal, cx);
                 }
                 cx.stop_propagation();
             }
-        });
+        })
+}
+
+/// Render Mermaid source to SVG, tuned for the transcript's theme.
+fn render_mermaid_svg(code: &str, is_dark: bool) -> Option<String> {
+    let mut theme = if is_dark {
+        MermaidTheme::dark()
+    } else {
+        MermaidTheme::modern()
+    };
+    // The diagram card already paints its surface; a full-canvas background
+    // rectangle would otherwise show a hard white/dark box in both themes.
+    theme.background = "transparent".into();
+    render_with_options(code, RenderOptions { theme, ..RenderOptions::default() }).ok()
+}
+
+// ── Mermaid zoom and pan ───────────────────────────────────────────────────
+
+/// Zoom sentinel for the default view: the diagram is fitted to its render box
+/// by layout constraints, and the exact scale is resolved from the scroll
+/// container's laid-out bounds on the first zoom gesture.
+const MERMAID_ZOOM_FIT: f32 = 0.0;
+const MERMAID_ZOOM_MIN: f32 = 0.25;
+const MERMAID_ZOOM_MAX: f32 = 8.0;
+/// How much one scroll-wheel notch (or one accumulated trackpad tick) zooms.
+const MERMAID_ZOOM_STEP: f32 = 0.1;
+/// Precise (trackpad) pixels that make up one zoom tick.
+const MERMAID_PIXELS_PER_ZOOM_TICK: f32 = 20.0;
+const MERMAID_MAX_HEIGHT: f32 = 480.0;
+/// The diagram body's padding on each side; the fitted diagram's box is the
+/// scroll container's content area (its laid-out bounds minus this).
+const MERMAID_BODY_PADDING: f32 = 12.0;
+/// The tallest fitted diagram, after the body's vertical padding.
+const MERMAID_FIT_MAX_HEIGHT: f32 = MERMAID_MAX_HEIGHT - MERMAID_BODY_PADDING * 2.0;
+
+/// Recover a Mermaid SVG's natural logical size from its root element.
+///
+/// `mermaid-rs-renderer` emits `width`/`height` except for the `useMaxWidth`
+/// diagram types, which emit `width="100%"` and no height. The always-numeric
+/// `viewBox` is the fallback for those.
+fn mermaid_svg_size(svg: &str) -> Option<(f32, f32)> {
+    let svg_start = svg.find("<svg")?;
+    let opening_end = svg_start + svg[svg_start..].find('>')?;
+    let opening = &svg[svg_start..opening_end];
+
+    let width = svg_attr(opening, "width").and_then(|value| value.parse::<f32>().ok());
+    let height = svg_attr(opening, "height").and_then(|value| value.parse::<f32>().ok());
+    if let (Some(width), Some(height)) = (width, height)
+        && width.is_finite()
+        && height.is_finite()
+        && width > 0.0
+        && height > 0.0
+    {
+        return Some((width, height));
+    }
+
+    let view_box = svg_attr(opening, "viewBox")?;
+    let mut parts = view_box
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|part| !part.is_empty());
+    let _x = parts.next()?;
+    let _y = parts.next()?;
+    let width = parts.next()?.parse::<f32>().ok()?;
+    let height = parts.next()?.parse::<f32>().ok()?;
+    (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+        .then_some((width, height))
+}
+
+/// The value of `name` inside an SVG root tag, if present.
+fn svg_attr<'a>(svg_opening: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = svg_opening.find(&needle)? + needle.len();
+    let end = start + svg_opening[start..].find('"')?;
+    Some(&svg_opening[start..end])
+}
+
+/// How many zoom ticks a wheel event represents. Discrete notches always count
+/// as exactly one step regardless of the platform's reported line count;
+/// trackpad pixels contribute fractional ticks, capped at one.
+fn mermaid_zoom_ticks(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Lines(lines) => lines.y,
+        ScrollDelta::Pixels(pixels) => f32::from(pixels.y) / MERMAID_PIXELS_PER_ZOOM_TICK,
+    }
+    .clamp(-1.0, 1.0)
+}
+
+/// The zoom that fits a diagram into its render box: the scroll container's
+/// content area (its laid-out bounds minus the body padding) over the natural
+/// size, never upscaling. Element layout runs after the pass that builds the
+/// block, so this is resolved from the tracked scroll handle on the first
+/// zoom gesture rather than at build time.
+fn mermaid_fit_zoom(entry: &MermaidCacheEntry) -> f32 {
+    let Some((natural_width, natural_height)) = entry.natural_size else {
+        return 1.0;
+    };
+    let bounds = entry.scroll_handle.bounds();
+    let box_width =
+        f32::from(bounds.size.width - px(MERMAID_BODY_PADDING * 2.0)).max(1.0);
+    let box_height =
+        f32::from(bounds.size.height - px(MERMAID_BODY_PADDING * 2.0)).max(1.0);
+    let fit = (box_width / natural_width)
+        .min(box_height / natural_height)
+        .min(1.0);
+    fit.clamp(MERMAID_ZOOM_MIN, MERMAID_ZOOM_MAX)
+}
+
+/// Apply `ticks` worth of zoom to a diagram, returning whether it changed.
+///
+/// The default view is fit-to-box; the first gesture adopts the measured fit
+/// scale as its base, so zooming in from the default works.
+fn zoom_mermaid_by_ticks(state: &MermaidState, ordinal: usize, ticks: f32) -> bool {
+    let mut cache = state.borrow_mut();
+    let Some(entry) = cache.get_mut(&ordinal) else {
+        return false;
+    };
+    let base = if entry.zoom == MERMAID_ZOOM_FIT {
+        mermaid_fit_zoom(entry)
+    } else {
+        entry.zoom
+    };
+    let zoom = (base + ticks * MERMAID_ZOOM_STEP).clamp(MERMAID_ZOOM_MIN, MERMAID_ZOOM_MAX);
+    if (base - zoom).abs() <= f32::EPSILON {
+        return false;
+    }
+    entry.zoom = zoom;
+    true
+}
+
+/// Reset a diagram to its fitted default and scroll origin, returning whether
+/// anything changed.
+fn reset_mermaid_view(state: &MermaidState, ordinal: usize) -> bool {
+    let mut cache = state.borrow_mut();
+    let Some(entry) = cache.get_mut(&ordinal) else {
+        return false;
+    };
+    let zoom_changed = (entry.zoom - MERMAID_ZOOM_FIT).abs() > f32::EPSILON;
+    let offset = entry.scroll_handle.offset();
+    let offset_changed = offset.x != px(0.0) || offset.y != px(0.0);
+    entry.zoom = MERMAID_ZOOM_FIT;
+    entry.scroll_handle.set_offset(point(px(0.0), px(0.0)));
+    zoom_changed || offset_changed
+}
+
+/// Ctrl/Cmd + wheel zooms; every other wheel gesture falls through to the
+/// scroll container and pans.
+fn mermaid_scroll_wheel_handler(
+    state: Option<MermaidState>,
+    ordinal: usize,
+) -> impl Fn(&ScrollWheelEvent, &mut Window, &mut gpui::App) + 'static {
+    move |event, _window, cx| {
+        if !(event.modifiers.control || event.modifiers.platform) {
+            return;
+        }
+        // Zoom owns the ctrl/cmd gesture; never let it also scroll the card.
+        cx.stop_propagation();
+        if let Some(state) = &state {
+            let ticks = mermaid_zoom_ticks(event.delta);
+            if ticks != 0.0 && zoom_mermaid_by_ticks(state, ordinal, ticks) {
+                cx.refresh_windows();
+            }
+        }
+    }
+}
+
+fn begin_mermaid_pan(
+    state: &MermaidState,
+    ordinal: usize,
+    event: &MouseDownEvent,
+    cx: &mut gpui::App,
+) {
+    let mut cache = state.borrow_mut();
+    if let Some(entry) = cache.get_mut(&ordinal) {
+        if entry.drag_start.is_none() {
+            entry.drag_start = Some((event.position, entry.scroll_handle.offset()));
+            cx.refresh_windows();
+        }
+    }
+}
+
+fn continue_mermaid_pan(
+    state: &MermaidState,
+    ordinal: usize,
+    event: &MouseMoveEvent,
+    cx: &mut gpui::App,
+) {
+    let mut cache = state.borrow_mut();
+    let Some(entry) = cache.get_mut(&ordinal) else {
+        return;
+    };
+    let Some((start_position, start_offset)) = entry.drag_start else {
+        return;
+    };
+    let delta = event.position - start_position;
+    let max = entry.scroll_handle.max_offset();
+    let x = f32::from(start_offset.x + delta.x).clamp(f32::from(-max.x), 0.0);
+    let y = f32::from(start_offset.y + delta.y).clamp(f32::from(-max.y), 0.0);
+    entry.scroll_handle.set_offset(point(px(x), px(y)));
+    cx.refresh_windows();
+}
+
+fn end_mermaid_pan(state: &MermaidState, ordinal: usize, cx: &mut gpui::App) {
+    let mut cache = state.borrow_mut();
+    if let Some(entry) = cache.get_mut(&ordinal) {
+        if entry.drag_start.take().is_some() {
+            cx.refresh_windows();
+        }
+    }
+}
+
+/// The header's zoom readout, shown only while zoomed away from the fitted
+/// default. Clicking (or Enter/Space on) it resets to fit and back to the
+/// origin.
+fn mermaid_zoom_reset_chip(
+    state: Option<MermaidState>,
+    ordinal: usize,
+    zoom: f32,
+    key: &TextKey,
+    ctx: &Ctx,
+) -> Option<AnyElement> {
+    if (zoom - MERMAID_ZOOM_FIT).abs() < 0.001 {
+        return None;
+    }
+    let state = state?;
+    let percent = (zoom * 100.0).round() as i32;
+
+    Some(
+        div()
+            .id(SharedString::from(format!(
+                "mermaid-zoom-reset-{}-{}",
+                key.row, key.index
+            )))
+            .tab_index(0)
+            .h(px(20.0))
+            .px(px(6.0))
+            .flex_none()
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .text_size(px(10.0))
+            .line_height(px(14.0))
+            .text_color(ctx.palette.ghost)
+            .cursor_default()
+            .hover(|style| style.bg(ctx.palette.overlay).text_color(ctx.palette.text))
+            .focus_visible(|style| style.border_1().border_color(ctx.palette.accent))
+            .child(SharedString::from(format!("{percent}%")))
+            .tooltip(Tooltip::text("Reset zoom"))
+            .on_click({
+                let state = state.clone();
+                move |_, _, cx| {
+                    if reset_mermaid_view(&state, ordinal) {
+                        cx.refresh_windows();
+                    }
+                }
+            })
+            .on_key_down({
+                let state = state.clone();
+                move |event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        if reset_mermaid_view(&state, ordinal) {
+                            cx.refresh_windows();
+                        }
+                        cx.stop_propagation();
+                    }
+                }
+            })
+            .into_any_element(),
+    )
+}
+
+/// A Mermaid fenced block, rendered as a diagram card. Falls back to the
+/// ordinary code block when the source cannot be laid out.
+///
+/// The diagram body is a two-axis scroll container. Its default view fits the
+/// diagram to the render box via constraint sizing, so nothing is clipped and
+/// no scrollbars appear; Ctrl/Cmd + wheel zooms from that fit, drag-to-pan
+/// moves a zoomed diagram, and the header's chip resets back to fit.
+fn render_mermaid_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElement {
+    // Peek the ordinal this block owns so a failed render can hand the same
+    // key to the code-block fallback without double-consuming.
+    let ordinal = ctx.next_ordinal.get();
+    let render = match ctx.cache {
+        Some(view) => view.mermaid_render(ordinal, code, ctx.palette.is_dark),
+        None => {
+            // A one-shot render has no cross-frame cache to persist zoom/pan
+            // into, so it just shows the diagram fitted to its box.
+            let (image, natural_size) = match render_mermaid_svg(code, ctx.palette.is_dark) {
+                Some(svg) => {
+                    let natural_size = mermaid_svg_size(&svg);
+                    let image = Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Svg,
+                        svg.into_bytes(),
+                    ));
+                    (Some(image), natural_size)
+                }
+                None => (None, None),
+            };
+            MermaidRender {
+                image,
+                natural_size,
+                zoom: MERMAID_ZOOM_FIT,
+                dragging: false,
+                scroll_handle: ScrollHandle::new(),
+            }
+        }
+    };
+
+    let Some(image) = render.image else {
+        return render_code_block(language, code, ctx);
+    };
+
+    let key = ctx.next_key();
+    let label = language
+        .filter(|language| !language.is_empty())
+        .map(|language| language.to_ascii_lowercase());
+    let copy_button = code_copy_button(
+        "copy-mermaid",
+        &key,
+        SharedString::from(code.to_owned()),
+        ctx,
+    );
+
+    // Shared state the event handlers mutate; every transcript render passes a
+    // cache, so zoom/pan changes are re-rendered on the next frame.
+    let state = ctx.cache.map(|view| view.mermaid.clone());
+
+    let zoom = render.zoom;
+    // The fitted default renders through layout constraints (max-width/max-
+    // height + scale-down), so it tracks the actual box at any transcript
+    // width; an explicit pixel size only kicks in once the user zooms.
+    let display_size = if zoom != MERMAID_ZOOM_FIT {
+        render
+            .natural_size
+            .map(|(width, height)| size(px(width * zoom), px(height * zoom)))
+    } else {
+        None
+    };
+    let scroll_handle = render.scroll_handle.clone();
+    let zoom_control = mermaid_zoom_reset_chip(state.clone(), ordinal, zoom, &key, ctx);
+
+    div()
+        .id(SharedString::from(format!(
+            "mermaid-block-{}-{}",
+            key.row, key.index
+        )))
+        .tab_group()
+        .tab_stop(false)
+        .w_full()
+        .min_w_0()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(ctx.palette.border)
+        .bg(ctx.palette.inset)
+        .overflow_hidden()
+        .child(
+            div()
+                .w_full()
+                .h(px(28.0))
+                .pl(px(10.0))
+                .pr(px(2.0))
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(ctx.palette.border)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(10.0))
+                        .line_height(px(14.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(ctx.palette.ghost)
+                        .when_some(label, |element, label| {
+                            element.child(SharedString::from(label))
+                        }),
+                )
+                .when_some(zoom_control, |header, control| header.child(control))
+                .child(copy_button),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "mermaid-body-{}-{}",
+                    key.row, key.index
+                )))
+                .w_full()
+                .min_w_0()
+                .max_h(px(MERMAID_MAX_HEIGHT))
+                .px(px(MERMAID_BODY_PADDING))
+                .py(px(MERMAID_BODY_PADDING))
+                .overflow_scroll()
+                .track_scroll(&scroll_handle)
+                .cursor(if render.dragging {
+                    CursorStyle::ClosedHand
+                } else {
+                    CursorStyle::OpenHand
+                })
+                .on_scroll_wheel(mermaid_scroll_wheel_handler(state.clone(), ordinal))
+                .on_mouse_down(MouseButton::Left, {
+                    let state = state.clone();
+                    move |event, _, cx| {
+                        if let Some(state) = &state {
+                            begin_mermaid_pan(state, ordinal, event, cx);
+                        }
+                    }
+                })
+                .on_mouse_move({
+                    let state = state.clone();
+                    move |event, _, cx| {
+                        if let Some(state) = &state {
+                            continue_mermaid_pan(state, ordinal, event, cx);
+                        }
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, {
+                    let state = state.clone();
+                    move |_, _, cx| {
+                        if let Some(state) = &state {
+                            end_mermaid_pan(state, ordinal, cx);
+                        }
+                    }
+                })
+                .on_mouse_up_out(MouseButton::Left, {
+                    let state = state.clone();
+                    move |_, _, cx| {
+                        if let Some(state) = &state {
+                            end_mermaid_pan(state, ordinal, cx);
+                        }
+                    }
+                })
+                .child(
+                    img(image)
+                        .id(SharedString::from(format!(
+                            "mermaid-image-{}-{}",
+                            key.row, key.index
+                        )))
+                        .rounded(px(4.0))
+                        .when_some(display_size, |element, display_size| {
+                            element.w(display_size.width).h(display_size.height)
+                        })
+                        .when(zoom == MERMAID_ZOOM_FIT, |element| {
+                            // Fit-to-box: never larger than the render box, in
+                            // either dimension, and never upscaled.
+                            element
+                                .max_w(relative(1.0))
+                                .max_h(px(MERMAID_FIT_MAX_HEIGHT))
+                                .object_fit(ObjectFit::ScaleDown)
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_code_block(language: Option<&str>, code: &str, ctx: &Ctx) -> AnyElement {
+    let key = ctx.next_key();
+    // Tokenizing is the most expensive flatten in the document, so a settled
+    // code block is exactly the case the cache exists for.
+    let flat = ctx.flat(key.index, || {
+        let lang = language.and_then(highlight::lang_for_tag);
+        let mut code_font = font(MONO_FAMILY);
+        code_font.weight = FontWeight::NORMAL;
+        FlatText {
+            text: SharedString::from(code.to_owned()),
+            runs: code_runs(code, lang, &code_font, ctx.palette),
+            links: Vec::new(),
+            code_ranges: Vec::new(),
+        }
+    });
+    let label = language
+        .filter(|language| !language.is_empty())
+        .map(|language| language.to_ascii_lowercase());
+    // `flat.text` is the cached shaped string; cloning it is O(1), so the
+    // source is only allocated when the button is actually invoked.
+    let copy_button = code_copy_button("copy-code", &key, flat.text.clone(), ctx);
 
     div()
         .id(SharedString::from(format!(
@@ -1743,6 +2316,10 @@ mod tests {
     #[test]
     fn code_block_rendering_wraps_and_exposes_a_keyboard_copy_control() {
         let source = include_str!("render.rs");
+
+        // The code block itself stays a soft-wrapping surface without
+        // horizontal scroll or nowrap, and delegates the copy affordance to
+        // the shared button builder.
         let start = source
             .find("\nfn render_code_block(")
             .expect("code block renderer");
@@ -1751,10 +2328,21 @@ mod tests {
             .find("\nfn code_runs(")
             .expect("code block renderer end");
         let body = &body[..end];
-
         assert!(body.contains(".whitespace_normal()"));
         assert!(!body.contains(".overflow_x_scroll()"));
         assert!(!body.contains(".whitespace_nowrap()"));
+        assert!(body.contains("code_copy_button("));
+
+        // The shared copy button carries the keyboard reachable, clipboard
+        // wired, icon-swapping affordance used by both code and diagrams.
+        let start = source
+            .find("\nfn code_copy_button(")
+            .expect("copy button builder");
+        let body = &source[start + 1..];
+        let end = body
+            .find("\nfn render_mermaid_svg(")
+            .expect("copy button builder end");
+        let body = &body[..end];
         assert!(body.contains("\"icons/copy.svg\""));
         assert!(body.contains("\"icons/check.svg\""));
         assert!(body.contains("ClipboardItem::new_string"));
@@ -1950,5 +2538,110 @@ mod tests {
         // An empty table falls back to even columns.
         let even = column_widths(&[], &[], 3);
         assert!(even.iter().all(|width| (width - 1.0 / 3.0).abs() < 1e-6));
+    }
+
+    fn mermaid_state(zoom: f32) -> MermaidState {
+        let state: MermaidState = Rc::new(RefCell::new(HashMap::new()));
+        state.borrow_mut().insert(
+            0,
+            MermaidCacheEntry {
+                code_hash: 0,
+                natural_size: Some((100.0, 50.0)),
+                image: None,
+                zoom,
+                drag_start: None,
+                scroll_handle: ScrollHandle::new(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn mermaid_svg_size_parses_width_and_height() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="300.5" height="120" viewBox="0 0 300.5 120"></svg>"#;
+        let (width, height) = mermaid_svg_size(svg).expect("svg size");
+        assert!((width - 300.5).abs() < 1e-3);
+        assert!((height - 120.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mermaid_svg_size_falls_back_to_viewbox_for_max_width_diagrams() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 240, 80"></svg>"#;
+        assert_eq!(mermaid_svg_size(svg), Some((240.0, 80.0)));
+    }
+
+    #[test]
+    fn mermaid_zoom_ticks_are_one_step_per_notch() {
+        for lines in [1.0, 3.0, 5.0] {
+            assert_eq!(mermaid_zoom_ticks(ScrollDelta::Lines(point(0.0, lines))), 1.0);
+            assert_eq!(
+                mermaid_zoom_ticks(ScrollDelta::Lines(point(0.0, -lines))),
+                -1.0
+            );
+        }
+
+        let half_tick = mermaid_zoom_ticks(ScrollDelta::Pixels(point(px(0.0), px(10.0))));
+        assert!(half_tick > 0.0 && half_tick < 1.0);
+        assert_eq!(
+            mermaid_zoom_ticks(ScrollDelta::Pixels(point(px(0.0), px(500.0)))),
+            1.0
+        );
+        // Horizontal-only scrolling must not zoom.
+        assert_eq!(mermaid_zoom_ticks(ScrollDelta::Lines(point(2.0, 0.0))), 0.0);
+    }
+
+    #[test]
+    fn mermaid_zoom_accumulates_clamps_and_reports_changes() {
+        // Already zoomed away from fit: ticks accumulate on the current scale.
+        let state = mermaid_state(1.0);
+
+        assert!(zoom_mermaid_by_ticks(&state, 0, 1.0));
+        assert!((state.borrow().get(&0).unwrap().zoom - 1.1).abs() < 1e-6);
+
+        for _ in 0..1000 {
+            zoom_mermaid_by_ticks(&state, 0, 1.0);
+        }
+        assert!((state.borrow().get(&0).unwrap().zoom - MERMAID_ZOOM_MAX).abs() < 1e-6);
+
+        // Zooming past the max is a no-op, and unknown ordinals are too.
+        assert!(!zoom_mermaid_by_ticks(&state, 0, 1.0));
+        assert!(!zoom_mermaid_by_ticks(&state, 1, 1.0));
+    }
+
+    #[test]
+    fn mermaid_zoom_from_fit_adopts_the_fitted_scale_as_its_base() {
+        let state = mermaid_state(MERMAID_ZOOM_FIT);
+
+        // The fixture's scroll handle has never been laid out, so its box
+        // reads as a single pixel: the fit clamps to the minimum zoom, and
+        // the first gesture builds one tick on top of that base.
+        assert!(zoom_mermaid_by_ticks(&state, 0, 1.0));
+        let zoom = state.borrow().get(&0).unwrap().zoom;
+        assert!((zoom - (MERMAID_ZOOM_MIN + MERMAID_ZOOM_STEP)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mermaid_reset_restores_fit_and_origin() {
+        let state = mermaid_state(2.5);
+        {
+            let mut cache = state.borrow_mut();
+            cache
+                .get_mut(&0)
+                .unwrap()
+                .scroll_handle
+                .set_offset(point(px(-40.0), px(-20.0)));
+        }
+
+        assert!(reset_mermaid_view(&state, 0));
+        {
+            let cache = state.borrow();
+            let entry = cache.get(&0).unwrap();
+            assert_eq!(entry.zoom, MERMAID_ZOOM_FIT);
+            assert_eq!(entry.scroll_handle.offset().x, px(0.0));
+            assert_eq!(entry.scroll_handle.offset().y, px(0.0));
+        }
+
+        // A second reset, with nothing left to change, is a no-op.
+        assert!(!reset_mermaid_view(&state, 0));
     }
 }
